@@ -10,6 +10,7 @@ Privy is a native Android app that gives you a coordinated team of AI agents pow
 |------|-------------|
 | `privy_kaggle_demo.py` | End-to-end pipeline demo — run this on Kaggle |
 | `screenshots/` | Device screenshots from real Pixel 8 Pro |
+| `CLAUDE.md` | Claude Code guidance for working in this repo |
 | `README.md` | This file |
 | `LICENSE` | CC-BY 4.0 |
 
@@ -55,6 +56,16 @@ User Input
 ```
 
 Zero real PII reaches the cloud. Verified on every query.
+
+## Model Architecture
+
+| Component | Real App (Pixel 8 Pro) | This Notebook |
+|-----------|------------------------|---------------|
+| Routing (intent + PII risk) | Gemma 4 E4B on-device via AICore/LiteRT | `gemma-3n-e4b-it` via API |
+| PII NER detection | Gemma 4 E4B on-device via AICore/LiteRT | `gemma-3n-e4b-it` via API |
+| Cloud reasoning | Gemma 4 26B via Google AI Studio | `gemma-4-26b-a4b-it` via API |
+
+`gemma-3n-e4b-it` is the E4B architecture available via Google AI Studio API. The real app runs the same architecture locally via AICore — no network call for routing or NER.
 
 ## Note on Reproducibility
 
