@@ -27,6 +27,18 @@
 # Kaggle cannot execute AICore, so this notebook demonstrates the **identical pipeline logic**
 # using the Google AI Studio API to simulate both the on-device routing/NER and cloud reasoning.
 # On-device performance benchmarks from the real device are included in Cell 14.
+#
+# ### Model Architecture
+# | Component | Real App (Pixel 8 Pro) | This Notebook |
+# |-----------|------------------------|---------------|
+# | Routing (intent + PII risk) | Gemma 4 E4B on-device (AICore/LiteRT) | `gemma-3n-e4b-it` via API |
+# | PII NER detection | Gemma 4 E4B on-device (AICore/LiteRT) | `gemma-3n-e4b-it` via API |
+# | Cloud reasoning | Gemma 4 26B via Google AI Studio | `gemma-4-26b-a4b-it` via API |
+#
+# **Why two model sizes?** Routing and NER run on the compact E4B model — fast classification
+# that keeps all data on-device. Complex reasoning over the *sanitized* query uses the 26B
+# MoE model in the cloud. `gemma-3n-e4b-it` is the E4B architecture available via API;
+# the real app uses the same architecture running locally via AICore, with no network call.
 
 # %% [markdown]
 # ## Cell 2 — Setup & API Configuration
@@ -64,21 +76,30 @@ if not GOOGLE_AI_STUDIO_KEY:
     print("⚠️  No API key found. Set GOOGLE_AI_STUDIO_KEY env var, Kaggle Secret, or edit below.")
     GOOGLE_AI_STUDIO_KEY = "YOUR_KEY_HERE"
 
-GEMMA_MODEL = "gemma-4-26b-a4b-it"  # Gemma 4 MoE (26B params, 4B active) — matches real app
-# Real app cloud model: gemma-4-31b-it  |  Fast fallback: gemini-2.0-flash
-BASE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMMA_MODEL}"
+# Cloud reasoning model — Gemma 4 26B MoE (26B params, 4B active)
+# Matches the cloud model used by the real Privy app (which uses gemma-4-31b-it in prod)
+GEMMA_MODEL = "gemma-4-26b-a4b-it"
+
+# On-device simulation model — E4B architecture (4B params), same as what runs via AICore/LiteRT
+# NOTE: Google AI Studio does not host Gemma 4 E4B as a separate endpoint.
+# gemma-3n-e4b-it is the E4B architecture available via API and is used here to simulate
+# the on-device component. The real app runs this architecture locally — no API call needed.
+GEMMA_MODEL_ON_DEVICE = "gemma-3n-e4b-it"
+
+_GEMMA_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 _api_available = False
 
 
 def call_gemma(prompt: str, system_prompt: str = None, temperature: float = 0.7,
-               timeout: int = 90) -> str:
+               timeout: int = 90, model: str = None) -> str:
     """Call Gemma via Google AI Studio REST API. Returns '' on failure."""
     global _api_available
     if GOOGLE_AI_STUDIO_KEY in ("", "YOUR_KEY_HERE"):
         return "[API key not set — skipping live call]"
 
-    url = f"{BASE_URL}:generateContent?key={GOOGLE_AI_STUDIO_KEY}"
+    use_model = model or GEMMA_MODEL
+    url = f"{_GEMMA_BASE}/{use_model}:generateContent?key={GOOGLE_AI_STUDIO_KEY}"
     body: dict = {"contents": [{"parts": [{"text": prompt}]}],
                   "generationConfig": {"temperature": temperature}}
     if system_prompt:
@@ -86,6 +107,12 @@ def call_gemma(prompt: str, system_prompt: str = None, temperature: float = 0.7,
 
     try:
         resp = requests.post(url, json=body, timeout=timeout)
+        # Some models (e.g. gemma-3n-e4b-it) don't support system_instruction —
+        # retry with the system prompt inlined into the user message
+        if resp.status_code == 400 and system_prompt:
+            body.pop("system_instruction", None)
+            body["contents"][0]["parts"][0]["text"] = f"{system_prompt}\n\n{prompt}"
+            resp = requests.post(url, json=body, timeout=timeout)
         resp.raise_for_status()
         text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
         _api_available = True
@@ -97,9 +124,12 @@ def call_gemma(prompt: str, system_prompt: str = None, temperature: float = 0.7,
 
 # Quick connectivity check
 print("🔌 Testing API connection...")
-ping = call_gemma("Reply with exactly: PRIVY_READY", temperature=0.0)
+ping = call_gemma("Reply with exactly: PRIVY_READY", temperature=0.0,
+                  model=GEMMA_MODEL_ON_DEVICE)
 if "PRIVY_READY" in ping or ping == "[API key not set — skipping live call]":
-    print(f"✅ API ready — model: {GEMMA_MODEL}")
+    print(f"✅ API ready")
+    print(f"   On-device sim : {GEMMA_MODEL_ON_DEVICE}  (E4B architecture — routing + NER)")
+    print(f"   Cloud model   : {GEMMA_MODEL}  (26B MoE — complex reasoning)")
 else:
     print(f"⚠️  Unexpected response: {ping!r}")
 
@@ -323,7 +353,9 @@ def detect_gemma_ner(text: str) -> List[PiiEntity]:
         return _ner_cache[cache_key]
 
     prompt = _NER_PROMPT_SIMPLE + text + "\n\nJSON array:"
-    response = call_gemma(prompt, temperature=0.1, timeout=150)
+    # In real app: Gemma 4 E4B runs NER entirely on-device (~800-2000ms, zero network)
+    # Here: simulated via API call to the E4B architecture model for notebook reproducibility
+    response = call_gemma(prompt, temperature=0.1, timeout=150, model=GEMMA_MODEL_ON_DEVICE)
 
     # ── debug: show what the model actually returned ───────────────────────────
     print(f"  🔍 NER raw response ({len(response)} chars):")
@@ -362,6 +394,9 @@ def detect_gemma_ner(text: str) -> List[PiiEntity]:
             # Clamp confidence to valid range — bullets can capture phone area codes as conf
             raw_conf = float(item.get("confidence", 0.9))
             confidence = raw_conf if 0.0 <= raw_conf <= 1.0 else 0.9
+            # Skip low-confidence detections — avoids false positives like year numbers
+            if confidence < 0.80:
+                continue
             out.append(PiiEntity(
                 value=value, pii_type=pii_type,
                 start=idx, end=idx + len(value) if idx >= 0 else -1,
@@ -636,7 +671,10 @@ _AGENT_SYSTEMS = {
 
 def route_query(query: str) -> dict:
     """Classify a query. Mirrors Privy's on-device QueryRouter.kt."""
-    response = call_gemma(f"User query: {query}", system_prompt=_ROUTER_SYSTEM, temperature=0.1)
+    # In real app: runs on-device via Gemma 4 E4B (AICore/LiteRT) — ~500-800ms, zero network
+    # Here: simulated via API call to the E4B architecture model for notebook reproducibility
+    response = call_gemma(f"User query: {query}", system_prompt=_ROUTER_SYSTEM,
+                          temperature=0.1, model=GEMMA_MODEL_ON_DEVICE)
     if not response or response.startswith("[API"):
         # Offline fallback: conservative defaults
         return {"agent": "general", "pii_risk": "high", "complexity": "complex", "route": "cloud"}
@@ -783,7 +821,8 @@ print(f"   → Typical on-device latency: 800ms–2s")
 print(f"\n💡 Simulating on-device response via API (for notebook reproducibility):\n")
 
 _t = time.time()
-_resp3 = call_gemma(_query3, system_prompt=_AGENT_SYSTEMS["general"], temperature=0.2)
+_resp3 = call_gemma(_query3, system_prompt=_AGENT_SYSTEMS["general"], temperature=0.2,
+                    model=GEMMA_MODEL_ON_DEVICE)
 _sim_s3 = time.time() - _t
 
 print(_resp3 if _resp3 else "(skipped — no API key)")
@@ -843,6 +882,8 @@ print(f"✅ Cloud response was re-personalized on-device — user saw their real
 # | Queries handled on-device | ~40–60% | Depends on query type |
 # | PII detection recall | ~90%+ | Regex + Gemma NER combined |
 # | PII leaked to cloud | 0 | By design — verified every run |
+# | On-device model | Gemma 4 E4B (4B params) | Routing + NER via AICore/LiteRT |
+# | Cloud model | Gemma 4 26B MoE (26B params, 4B active) | Google AI Studio API |
 #
 # ### This Notebook Run (API simulation)
 
