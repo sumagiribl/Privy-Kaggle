@@ -268,21 +268,6 @@ for e in regex_w2:
 # names, addresses, and employers that deterministic regex cannot.
 
 # %%
-_NER_PROMPT_TEMPLATE = """\
-Your job is PII extraction. Study the example then extract from the real text.
-
-### Example input
-"Patient Jane Smith, DOB 04/10/1975, SSN 321-54-9876, works at Global Health Partners, email jsmith@acme.com"
-
-### Example output (JSON array, nothing else)
-[{{"entity": "Jane Smith", "type": "person_name", "confidence": 0.99}}, {{"entity": "04/10/1975", "type": "date_of_birth", "confidence": 0.99}}, {{"entity": "321-54-9876", "type": "ssn", "confidence": 0.99}}, {{"entity": "Global Health Partners", "type": "employer", "confidence": 0.95}}, {{"entity": "jsmith@acme.com", "type": "email", "confidence": 0.99}}]
-
-### Real text to extract from
-{text}
-
-### Output — valid JSON array, nothing else
-["""
-
 _NER_TYPE_MAP = {
     "person_name": PiiType.PERSON_NAME, "address": PiiType.ADDRESS,
     "phone": PiiType.PHONE,             "email": PiiType.EMAIL,
@@ -291,55 +276,99 @@ _NER_TYPE_MAP = {
     "income_amount": PiiType.INCOME_AMOUNT,
 }
 
+# Simple prompt — no f-string double-brace escaping, no priming trick.
+# One-shot example shows the expected format; model fills in the rest.
+_NER_PROMPT_SIMPLE = """Extract ALL personally identifiable information (PII) from the text below.
 
-def _parse_ner_response(raw: str, primed: bool = True) -> list:
-    """Parse the model response as JSON; fall back to regex over the bullet-style format."""
-    # Try JSON first (model returned proper array)
-    candidate = ("[" + raw.strip()) if primed else raw.strip()
-    for fence in ("```json", "```"):
-        candidate = candidate.removeprefix(fence)
-    candidate = candidate.removesuffix("```").strip()
-    start, end = candidate.find("["), candidate.rfind("]")
-    if start >= 0 and end > start:
-        try:
-            return json.loads(candidate[start:end + 1])
-        except json.JSONDecodeError:
-            pass
+Return ONLY a JSON array. Each item must have these exact fields:
+- "entity": the exact text from the document
+- "type": one of person_name, address, phone, email, ssn, date_of_birth, account_number, employer, income_amount
+- "confidence": a number from 0.0 to 1.0
 
-    # Fallback: parse the reasoning-style bullet format Gemma 4 sometimes produces.
-    # Matches: *   "John Doe" -> person_name  or  "John Doe" -> person_name (0.95)
-    items = []
-    for m in re.finditer(
-        r'"([^"]+)"\s*-+>\s*(person_name|address|phone|email|ssn|date_of_birth|account_number|employer|income_amount)'
-        r'(?:[^)\n]*\((\d+(?:\.\d+)?)\))?',
-        raw,
-    ):
-        entity_val, entity_type, conf = m.group(1), m.group(2), m.group(3)
-        items.append({"entity": entity_val, "type": entity_type, "confidence": float(conf) if conf else 0.9})
-    if items:
-        print(f"  ℹ️  NER: used bullet-format fallback parser ({len(items)} entities found)")
-    return items
+Example response format:
+[{"entity": "Jane Smith", "type": "person_name", "confidence": 0.95}, {"entity": "jsmith@acme.com", "type": "email", "confidence": 0.99}]
 
+Text to analyze:
+"""
 
-_ner_cache: dict = {}  # simple call-dedup cache — avoids redundant API hits within a session
+_ner_cache: dict = {}  # call-dedup cache — avoids redundant API hits within a session
 
 
 def detect_gemma_ner(text: str) -> List[PiiEntity]:
     """Context-aware PII detection via Gemma 4. Mirrors Privy's GemmaPiiDetector.kt."""
-    cache_key = text[:500]  # key on first 500 chars (enough to distinguish documents)
+    cache_key = text[:500]
     if cache_key in _ner_cache:
         return _ner_cache[cache_key]
 
-    prompt = _NER_PROMPT_TEMPLATE.format(text=text)
+    prompt = _NER_PROMPT_SIMPLE + text + "\n\nJSON array:"
     response = call_gemma(prompt, temperature=0.1)
+
+    # ── debug: show what the model actually returned ───────────────────────────
+    print(f"  🔍 NER raw response ({len(response)} chars):")
+    print(f"  {response[:500]}")
+
     if not response or response.startswith("[API"):
         _ner_cache[cache_key] = []
         return []
-    try:
-        items = _parse_ner_response(response, primed=True)
-    except Exception as e:
-        print(f"  ⚠️  NER parse error: {e} — raw: {response[:120]!r}")
-        return []
+
+    # ── Strategy: bullets first, then JSON ────────────────────────────────────
+    # Gemma 4 consistently outputs bullet lines like: "John Doe" -> `person_name`
+    # It also appends a JSON array, but that array is often a schema placeholder
+    # or has trailing garbage that breaks the parser. Parse bullets first.
+
+    _BULLET_RE = re.compile(
+        r'"([^"]+)"\s*[-→>]+\s*`?(person_name|address|phone|email|ssn|date_of_birth'
+        r'|account_number|employer|income_amount)`?(?:[^)\n]*\((\d+(?:\.\d+)?)\))?',
+    )
+
+    def _build_entities(raw_items: list, src_text: str) -> List[PiiEntity]:
+        out: List[PiiEntity] = []
+        for item in raw_items:
+            pii_type = _NER_TYPE_MAP.get((item.get("type") or "").lower())
+            if not pii_type:
+                continue
+            value = (item.get("entity") or "").strip()
+            if not value or value in ("...", "<entity>"):
+                continue  # skip schema placeholder rows
+            idx = src_text.find(value)
+            out.append(PiiEntity(
+                value=value, pii_type=pii_type,
+                start=idx, end=idx + len(value) if idx >= 0 else -1,
+                confidence=float(item.get("confidence", 0.9)), source="gemma_ner",
+            ))
+        return out
+
+    # 1. Bullet-format parse (primary — model reliably puts real data here)
+    bullet_raw = [
+        {"entity": m.group(1), "type": m.group(2),
+         "confidence": float(m.group(3)) if m.group(3) else 0.9}
+        for m in _BULLET_RE.finditer(response)
+    ]
+    if bullet_raw:
+        entities_out = _build_entities(bullet_raw, text)
+        print(f"  ℹ️  NER: bullet-format parsed {len(entities_out)} entities")
+        _ner_cache[cache_key] = entities_out
+        return entities_out
+
+    # 2. JSON parse fallback (if model outputs bare JSON with no bullet preamble)
+    cleaned = response.strip()
+    cleaned = re.sub(r'<think>.*?</think>', '', cleaned, flags=re.DOTALL).strip()
+    cleaned = cleaned.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    start = cleaned.find("[")
+    if start >= 0:
+        try:
+            items, _ = json.JSONDecoder().raw_decode(cleaned, start)
+            print(f"  🔍 Parsed {len(items)} items from JSON")
+            entities_out = _build_entities(items, text)
+            _ner_cache[cache_key] = entities_out
+            return entities_out
+        except json.JSONDecodeError as e:
+            print(f"  ⚠️  JSON parse failed: {e}")
+            print(f"  ⚠️  Attempted: {cleaned[start:start + 200]!r}")
+
+    print(f"  ⚠️  NER: no usable data in response")
+    _ner_cache[cache_key] = []
+    return []
 
     entities: List[PiiEntity] = []
     for item in items:
@@ -362,6 +391,8 @@ def detect_gemma_ner(text: str) -> List[PiiEntity]:
     return entities
 
 
+# Clear cache so Cell 5 always hits the API fresh (not a stale empty result)
+_ner_cache.clear()
 print("🧠 Gemma NER on W-2...")
 t0 = time.time()
 ner_w2 = detect_gemma_ner(FAKE_W2)
