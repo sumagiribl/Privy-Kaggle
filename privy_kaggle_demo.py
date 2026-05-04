@@ -71,7 +71,8 @@ BASE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMMA_MODE
 _api_available = False
 
 
-def call_gemma(prompt: str, system_prompt: str = None, temperature: float = 0.7) -> str:
+def call_gemma(prompt: str, system_prompt: str = None, temperature: float = 0.7,
+               timeout: int = 90) -> str:
     """Call Gemma via Google AI Studio REST API. Returns '' on failure."""
     global _api_available
     if GOOGLE_AI_STUDIO_KEY in ("", "YOUR_KEY_HERE"):
@@ -84,7 +85,7 @@ def call_gemma(prompt: str, system_prompt: str = None, temperature: float = 0.7)
         body["system_instruction"] = {"parts": [{"text": system_prompt}]}
 
     try:
-        resp = requests.post(url, json=body, timeout=90)
+        resp = requests.post(url, json=body, timeout=timeout)
         resp.raise_for_status()
         text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
         _api_available = True
@@ -269,24 +270,45 @@ for e in regex_w2:
 
 # %%
 _NER_TYPE_MAP = {
-    "person_name": PiiType.PERSON_NAME, "address": PiiType.ADDRESS,
-    "phone": PiiType.PHONE,             "email": PiiType.EMAIL,
-    "ssn": PiiType.SSN,                 "date_of_birth": PiiType.DATE_OF_BIRTH,
+    # Primary types
+    "person_name": PiiType.PERSON_NAME,    "address": PiiType.ADDRESS,
+    "phone": PiiType.PHONE,                "email": PiiType.EMAIL,
+    "ssn": PiiType.SSN,                    "date_of_birth": PiiType.DATE_OF_BIRTH,
     "account_number": PiiType.ACCOUNT_NUMBER, "employer": PiiType.EMPLOYER,
     "income_amount": PiiType.INCOME_AMOUNT,
+    # Aliases the model may use naturally — all map to existing PiiType values
+    "name": PiiType.PERSON_NAME,           "full_name": PiiType.PERSON_NAME,
+    "street_address": PiiType.ADDRESS,     "location": PiiType.ADDRESS,
+    "phone_number": PiiType.PHONE,         "telephone": PiiType.PHONE,
+    "email_address": PiiType.EMAIL,
+    "social_security_number": PiiType.SSN, "social_security": PiiType.SSN,
+    "dob": PiiType.DATE_OF_BIRTH,          "date": PiiType.DATE_OF_BIRTH,
+    "ein": PiiType.ACCOUNT_NUMBER,         "tax_id": PiiType.ACCOUNT_NUMBER,
+    "employer_id": PiiType.ACCOUNT_NUMBER, "patient_id": PiiType.ACCOUNT_NUMBER,
+    "member_id": PiiType.ACCOUNT_NUMBER,   "insurance_id": PiiType.ACCOUNT_NUMBER,
+    "routing_number": PiiType.ACCOUNT_NUMBER, "bank_account": PiiType.ACCOUNT_NUMBER,
+    "company": PiiType.EMPLOYER,           "organization": PiiType.EMPLOYER,
+    "insurance_provider": PiiType.EMPLOYER,"provider": PiiType.EMPLOYER,
+    "salary": PiiType.INCOME_AMOUNT,       "wages": PiiType.INCOME_AMOUNT,
+    "income": PiiType.INCOME_AMOUNT,       "compensation": PiiType.INCOME_AMOUNT,
 }
 
-# Simple prompt — no f-string double-brace escaping, no priming trick.
-# One-shot example shows the expected format; model fills in the rest.
-_NER_PROMPT_SIMPLE = """Extract ALL personally identifiable information (PII) from the text below.
+_NER_PROMPT_SIMPLE = """You are a PII extraction engine. Extract EVERY piece of personally identifiable information from the text below.
 
-Return ONLY a JSON array. Each item must have these exact fields:
-- "entity": the exact text from the document
-- "type": one of person_name, address, phone, email, ssn, date_of_birth, account_number, employer, income_amount
-- "confidence": a number from 0.0 to 1.0
+Return a JSON array. Each item: {"entity": "<exact text>", "type": "<type>", "confidence": <0.0-1.0>}
 
-Example response format:
-[{"entity": "Jane Smith", "type": "person_name", "confidence": 0.95}, {"entity": "jsmith@acme.com", "type": "email", "confidence": 0.99}]
+Types and what they cover:
+- person_name: any person's full or partial name (employees, patients, doctors, contacts, co-tenants)
+- address: any street address (employee home, employer location, rental property)
+- phone: any phone or fax number
+- email: any email address
+- ssn: Social Security Number (XXX-XX-XXXX)
+- date_of_birth: any date of birth or age-related date
+- account_number: bank accounts, routing numbers, EIN/employer tax ID, patient IDs, insurance member IDs, any ID number
+- employer: company name, employer, insurance provider, healthcare organization
+- income_amount: wages, salary, rent, deposits, any dollar amount tied to a person
+
+Be exhaustive — flag everything. When unsure, include with lower confidence.
 
 Text to analyze:
 """
@@ -301,7 +323,7 @@ def detect_gemma_ner(text: str) -> List[PiiEntity]:
         return _ner_cache[cache_key]
 
     prompt = _NER_PROMPT_SIMPLE + text + "\n\nJSON array:"
-    response = call_gemma(prompt, temperature=0.1)
+    response = call_gemma(prompt, temperature=0.1, timeout=150)
 
     # ── debug: show what the model actually returned ───────────────────────────
     print(f"  🔍 NER raw response ({len(response)} chars):")
@@ -316,9 +338,9 @@ def detect_gemma_ner(text: str) -> List[PiiEntity]:
     # It also appends a JSON array, but that array is often a schema placeholder
     # or has trailing garbage that breaks the parser. Parse bullets first.
 
+    # Match any type token the model writes — _NER_TYPE_MAP normalises aliases
     _BULLET_RE = re.compile(
-        r'"([^"]+)"\s*[-→>]+\s*`?(person_name|address|phone|email|ssn|date_of_birth'
-        r'|account_number|employer|income_amount)`?(?:[^)\n]*\((\d+(?:\.\d+)?)\))?',
+        r'"([^"]+)"\s*[-→>]+\s*`?([a-z_]+)`?(?:[^)\n]*\((\d+(?:\.\d+)?)\))?',
     )
 
     def _build_entities(raw_items: list, src_text: str) -> List[PiiEntity]:
@@ -330,11 +352,20 @@ def detect_gemma_ner(text: str) -> List[PiiEntity]:
             value = (item.get("entity") or "").strip()
             if not value or value in ("...", "<entity>"):
                 continue  # skip schema placeholder rows
+            # Strip label prefixes: model often returns "Name: John Doe" or "EIN: 82-4471039"
+            # Try to use just the value after the colon if it exists in the source
+            if ": " in value:
+                after_colon = value.split(": ", 1)[1].strip()
+                if after_colon and src_text.find(after_colon) >= 0:
+                    value = after_colon
             idx = src_text.find(value)
+            # Clamp confidence to valid range — bullets can capture phone area codes as conf
+            raw_conf = float(item.get("confidence", 0.9))
+            confidence = raw_conf if 0.0 <= raw_conf <= 1.0 else 0.9
             out.append(PiiEntity(
                 value=value, pii_type=pii_type,
                 start=idx, end=idx + len(value) if idx >= 0 else -1,
-                confidence=float(item.get("confidence", 0.9)), source="gemma_ner",
+                confidence=confidence, source="gemma_ner",
             ))
         return out
 
@@ -369,26 +400,6 @@ def detect_gemma_ner(text: str) -> List[PiiEntity]:
     print(f"  ⚠️  NER: no usable data in response")
     _ner_cache[cache_key] = []
     return []
-
-    entities: List[PiiEntity] = []
-    for item in items:
-        pii_type = _NER_TYPE_MAP.get(item.get("type", "").lower())
-        if not pii_type:
-            continue
-        value = (item.get("entity") or "").strip()
-        if not value:
-            continue
-        idx = text.find(value)
-        entities.append(PiiEntity(
-            value=value,
-            pii_type=pii_type,
-            start=idx,
-            end=idx + len(value) if idx >= 0 else -1,
-            confidence=float(item.get("confidence", 0.5)),
-            source="gemma_ner",
-        ))
-    _ner_cache[cache_key] = entities
-    return entities
 
 
 # Clear cache so Cell 5 always hits the API fresh (not a stale empty result)
